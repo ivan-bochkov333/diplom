@@ -10,6 +10,9 @@ __pycache__/
 data/
 my_test_1_dataset/
 new_dataset/
+new_video_train/
+new_video_test/
+*.mp4
 
 # Training outputs
 outputs/

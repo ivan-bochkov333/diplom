@@ -1,0 +1,36 @@
+# Обучение на new_video_train, валидация на new_video_test
+# Train: python train.py --config configs/new_video_train.yaml
+# Eval:  python evaluate.py --checkpoint outputs/posenet/best.pth --data_root new_video_test --data_type colmap
+
+data:
+  type: "colmap"
+  root: "new_video_train"
+  image_size: 224
+  train_split: 0.8
+  normalize: false
+  num_workers: 0
+
+model:
+  name: "posenet"
+  params:
+    backbone: "resnet34"
+    pretrained: true
+    unfreeze_last_n: 2
+    dropout: 0.3
+    hidden_dim: 512
+
+training:
+  epochs: 80
+  batch_size: 16
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  scheduler: "cosine"
+  warmup_epochs: 3
+  patience: 15
+  amp: false
+  force_cpu: true
+
+output:
+  dir: "outputs"
+  save_best: true
+  tensorboard: true

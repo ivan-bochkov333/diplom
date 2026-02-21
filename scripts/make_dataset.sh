@@ -2,12 +2,14 @@
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
-  echo "Использование: $0 video_file [project_name]"
+  echo "Использование: $0 video_file [project_name] [fps]"
+  echo "  fps — опционально: брать N кадров в секунду (быстрее COLMAP). Без fps — все кадры."
   exit 1
 fi
 
 VIDEO="$1"
 PROJECT="${2:-colmap_project}"
+FPS="${3:-}"
 
 # 1. Проверки
 if ! command -v colmap >/dev/null 2>&1; then
@@ -42,7 +44,12 @@ mkdir -p "$SPARSE_DIR"
 # 3. Видео -> кадры
 echo "===> Извлекаю кадры из видео..."
 rm -f "$IMAGES_DIR"/*.jpg
-ffmpeg -y -i "$VIDEO" "$IMAGES_DIR/%06d.jpg"
+if [ -n "$FPS" ]; then
+  echo "  (режим: ${FPS} кадр/сек)"
+  ffmpeg -y -i "$VIDEO" -vf "fps=$FPS" "$IMAGES_DIR/%06d.jpg"
+else
+  ffmpeg -y -i "$VIDEO" "$IMAGES_DIR/%06d.jpg"
+fi
 
 # 4. COLMAP: feature extraction (CPU)
 echo "===> COLMAP feature_extractor..."
@@ -79,7 +86,8 @@ colmap model_converter \
 
 # 8. Извлекаем позы в CSV
 echo "===> Извлекаю позы в CSV..."
-python3 extract_colmap_poses.py "$MODEL_DIR/images.txt" "$PROJECT/poses.csv"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+python3 "$SCRIPT_DIR/extract_colmap_poses.py" "$MODEL_DIR/images.txt" "$PROJECT/poses.csv"
 
 echo
 echo "Готово!"
