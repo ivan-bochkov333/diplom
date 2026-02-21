@@ -1,0 +1,15 @@
+# PoseNet+ configuration
+
+model:
+  name: "posenet"
+  params:
+    backbone: "resnet34"
+    pretrained: true
+    unfreeze_last_n: 2
+    dropout: 0.3
+    hidden_dim: 512
+
+training:
+  epochs: 100
+  batch_size: 32
+  lr: 1.0e-4

@@ -1,0 +1,19 @@
+# TransPoseNet configuration
+
+model:
+  name: "transposenet"
+  params:
+    backbone: "resnet34"
+    pretrained: true
+    unfreeze_last_n: 2
+    dropout: 0.1
+    hidden_dim: 512
+    num_heads: 8
+    num_layers: 4
+    transformer_dim: 256
+
+training:
+  epochs: 200
+  batch_size: 16
+  lr: 5.0e-5
+  weight_decay: 1.0e-4

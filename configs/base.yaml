@@ -1,0 +1,44 @@
+# Base configuration — shared defaults for all experiments.
+# Override per-model settings in model-specific YAML files.
+
+data:
+  type: "colmap"                  # "colmap" or "7scenes"
+  root: "my_test_1_dataset"       # path to dataset root
+  image_size: 224
+  train_split: 0.8
+  normalize: false                # normalize positions (for multi-scene)
+  num_workers: 4
+
+  # 7scenes-specific
+  seven_scenes_root: "data/7scenes"
+  scenes: null                    # null = all scenes
+
+model:
+  name: "posenet"
+  params:
+    backbone: "resnet34"
+    pretrained: true
+    unfreeze_last_n: 2
+    dropout: 0.3
+    hidden_dim: 512
+
+training:
+  epochs: 100
+  batch_size: 32
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  scheduler: "cosine"             # "cosine", "step", "none"
+  warmup_epochs: 5
+  learn_loss_weights: true        # learnable sx/sq in PoseLoss
+
+  # early stopping
+  patience: 20
+  min_delta: 1.0e-4
+
+  # mixed precision
+  amp: true
+
+output:
+  dir: "outputs"
+  save_best: true
+  tensorboard: true

@@ -1,0 +1,36 @@
+# MS-Transformer pre-training on heads + fire (+ chess if available)
+# For GPU: amp=true, force_cpu=false, num_workers=4
+# For CPU/Mac: amp=false, force_cpu=true, num_workers=0
+
+data:
+  type: "7scenes"
+  normalize: true
+  seven_scenes_root: "data/7scenes"
+  scenes:
+    - "heads"
+    - "fire"
+  num_workers: 4
+
+model:
+  name: "ms_transformer"
+  params:
+    backbone: "resnet34"
+    pretrained: true
+    unfreeze_last_n: 2
+    dropout: 0.1
+    hidden_dim: 512
+    num_heads: 8
+    num_layers: 4
+    transformer_dim: 256
+    num_scenes: 2
+
+training:
+  epochs: 30
+  batch_size: 32
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler: "cosine"
+  warmup_epochs: 3
+  amp: true
+  patience: 10
+  force_cpu: false

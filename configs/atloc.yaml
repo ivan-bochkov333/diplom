@@ -1,0 +1,15 @@
+# AtLoc configuration
+
+model:
+  name: "atloc"
+  params:
+    backbone: "resnet34"
+    pretrained: true
+    unfreeze_last_n: 2
+    dropout: 0.3
+    hidden_dim: 512
+
+training:
+  epochs: 150
+  batch_size: 32
+  lr: 1.0e-4

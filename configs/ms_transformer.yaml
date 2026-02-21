@@ -1,0 +1,35 @@
+# MS-Transformer configuration (Multi-Scene)
+
+data:
+  type: "7scenes"
+  normalize: true
+  seven_scenes_root: "data/7scenes"
+  scenes: null                    # null = all 7 scenes
+
+model:
+  name: "ms_transformer"
+  params:
+    backbone: "resnet34"
+    pretrained: true
+    unfreeze_last_n: 2
+    dropout: 0.1
+    hidden_dim: 512
+    num_heads: 8
+    num_layers: 4
+    transformer_dim: 256
+    num_scenes: 7
+
+training:
+  epochs: 300
+  batch_size: 16
+  lr: 5.0e-5
+  weight_decay: 1.0e-4
+  scheduler: "cosine"
+  warmup_epochs: 10
+
+# Fine-tuning settings (used with --finetune flag)
+finetune:
+  epochs: 50
+  lr: 1.0e-5
+  batch_size: 16
+  freeze_backbone: true
