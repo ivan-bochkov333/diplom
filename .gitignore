@@ -12,7 +12,12 @@ my_test_1_dataset/
 new_dataset/
 new_video_train/
 new_video_test/
+train_v2_scene/
+test_v2_scene/
 *.mp4
+
+# Телеметрия оптики (положите локально; при необходимости снимите с игнора)
+AL_Optic*.csv
 
 # Training outputs
 outputs/

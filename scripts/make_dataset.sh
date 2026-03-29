@@ -58,10 +58,18 @@ colmap feature_extractor \
   --image_path "$IMAGES_DIR" \
   --ImageReader.single_camera 1
 
-# 5. COLMAP: matching (CPU)
-echo "===> COLMAP exhaustive_matcher..."
-colmap exhaustive_matcher \
-  --database_path "$DB_PATH"
+# 5. COLMAP: matching
+MATCHER="${COLMAP_MATCHER:-exhaustive}"
+if [ "$MATCHER" = "sequential" ]; then
+  echo "===> COLMAP sequential_matcher (для видео)..."
+  colmap sequential_matcher \
+    --database_path "$DB_PATH" \
+    --SequentialMatching.overlap 15
+else
+  echo "===> COLMAP exhaustive_matcher..."
+  colmap exhaustive_matcher \
+    --database_path "$DB_PATH"
+fi
 
 # 6. COLMAP: sparse reconstruction (mapper)
 echo "===> COLMAP mapper..."
@@ -70,23 +78,27 @@ colmap mapper \
   --image_path "$IMAGES_DIR" \
   --output_path "$SPARSE_DIR"
 
-MODEL_DIR="$SPARSE_DIR/0"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-if [ ! -d "$MODEL_DIR" ]; then
-  echo "Ошибка: не найдено $MODEL_DIR. Проверь вывод colmap mapper."
+# Сначала TXT для всех подмоделей (иначе нет images.txt для подсчёта кадров)
+echo "===> COLMAP model_converter -> TXT (все реконструкции)..."
+for d in "$SPARSE_DIR"/*/; do
+  [ -f "${d}images.bin" ] || continue
+  colmap model_converter \
+    --input_path "$d" \
+    --output_path "$d" \
+    --output_type TXT
+done
+
+MODEL_DIR="$(python3 "$SCRIPT_DIR/pick_largest_sparse_model.py" "$SPARSE_DIR")"
+if [ -z "$MODEL_DIR" ] || [ ! -d "$MODEL_DIR" ]; then
+  echo "Ошибка: нет реконструкции в $SPARSE_DIR. Проверь вывод colmap mapper."
   exit 1
 fi
-
-# 7. Конвертация модели в TXT
-echo "===> COLMAP model_converter -> TXT..."
-colmap model_converter \
-  --input_path "$MODEL_DIR" \
-  --output_path "$MODEL_DIR" \
-  --output_type TXT
+echo "===> Используем модель с наибольшим числом кадров: $MODEL_DIR"
 
 # 8. Извлекаем позы в CSV
 echo "===> Извлекаю позы в CSV..."
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 python3 "$SCRIPT_DIR/extract_colmap_poses.py" "$MODEL_DIR/images.txt" "$PROJECT/poses.csv"
 
 echo

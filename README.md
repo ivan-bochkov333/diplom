@@ -13,6 +13,7 @@
   - [Архитектуры моделей](#архитектуры-моделей)
   - [Сравнение моделей (бенчмарк)](#3-сравнение-моделей-бенчмарк)
   - [Инференс](#4-инференс)
+  - [Пайплайн v2 и оптический трекинг](#5-пайплайн-train_v2--test_v2-и-сравнение-с-оптическим-трекингом)
 - [Контекст и выводы](#контекст-и-выводы)
 - [Структура проекта](#структура-проекта)
 
@@ -167,6 +168,89 @@ xyz, quat = predict_pose(model, transform, device, "frame.jpg")  # или PIL.Im
 
 ---
 
+### 5. Пайплайн train_v2 / test_v2 и сравнение с оптическим трекингом
+
+Для пары роликов **train_v2.mp4** (обучение) и **test_v2.mp4** (тест) и файла **AL_Optic.csv** (эталон оптического трекинга на тестовом видео) можно прогнать всё одним скриптом.
+
+**Подготовка:** положите в корень проекта `train_v2.mp4`, `test_v2.mp4`, `AL_Optic.csv` (видео в `.gitignore`, CSV можно хранить в репозитории при необходимости).
+
+**Запуск (по умолчанию — все кадры видео, без прореживания; FPS для синхронизации с оптикой берётся из метаданных `test_v2.mp4`):**
+
+```bash
+./scripts/run_pipeline_v2.sh
+```
+
+Цепочка: COLMAP по **train** → обучение на `train_v2_scene` → COLMAP по **test** → инференс на кадры `test_v2_scene/images` → сравнение с `AL_Optic.csv`.
+
+Если нужно ускорить COLMAP, можно проредить кадры (тогда же передать тот же FPS в `compare_ml_optic`):
+
+```bash
+DOWNSAMPLE_FPS=5 ./scripts/run_pipeline_v2.sh
+```
+
+**Смысл сравнения:** оптический трекинг — **эталон**; выход модели сравнивается с ним после **выравнивания систем координат** (similarity transform Umeyama: масштаб + поворот + сдвиг), потому что COLMAP и оптика живут в разных СК и с разным масштабом.
+
+**Метрики** (как обсуждалось с научником):
+
+| Метрика | Смысл |
+|---------|--------|
+| Максимальное отклонение по позиции | Евклидово расстояние между выровненной ML-позицией и оптикой, м |
+| Среднее отклонение по позиции | То же, среднее по кадрам, м |
+| Максимальное по сферическому расстоянию ориентации | Угол между ориентациями (геодезия на SO(3)), ° |
+| Среднее по сферическому расстоянию ориентации | То же, среднее по кадрам, ° |
+
+В выводе и JSON скрипта также печатаются **медиана** и **RMSE** по позиции (как необязательное дополнение к базовому минимуму).
+
+При больших абсолютных углах ориентации (~90–180°) из‑за несовпадения объявленных осей экспорта оптики и COLMAP имеет смысл добавить **`--kabsch_orientation_calibration`**: по всей траектории оценивается постоянный поворот `R_kabsch` (Kabsch в SO(3)), после чего печатаются пересчитанные макс./средн./медиана по углу; базовые четыре метрики без этого флага не меняются. Дополнительно скрипт печатает **относительную** ошибку ориентации между соседними кадрами (насколько совпадают «шаги» поворота ML и оптики); отключить: `--no_relative_orientation`.
+
+**Отдельно только сравнение** (если уже есть `pred_poses.csv`):
+
+```bash
+python scripts/compare_ml_optic.py \
+  --optic_csv AL_Optic.csv \
+  --pred_csv test_v2_scene/pred_poses.csv \
+  --frames_fps 30 \
+  --kabsch_orientation_calibration
+```
+
+(`--frames_fps` должен совпадать с тем, как извлекали кадры: нативный FPS ролика или значение `DOWNSAMPLE_FPS`.)
+
+Если запись видео и оптики сдвинута по времени, подберите `--time_offset_sec`. Если кватернионы в CSV в порядке `xyzw`, укажите `--optic_quat_order xyzw`.
+
+**Камера и датчик на креплении:** в `pred_poses.csv` хранится поза **камеры** (как в COLMAP: `X_cam = R @ X_world`), а в оптике — трек **датчика** на стойке. Скрипт переводит ориентацию в «датчик в мире» как `R_align @ R_wc^T @ R_sensor_to_camera` и сравнивает с кватернионом оптики (по умолчанию в том же смысле, что COLMAP: базис тела в мире = `R(q)^T`). Пресет по схеме осей на фото (датчик: X вниз, Y вправо, Z вперёд vs камера OpenCV: X вправо, Y вниз, Z вперёд): `--rig_preset diagram_xy_swap` (по умолчанию). Своя жёсткая калибровка: `--sensor_to_camera_rowmajor` (9 чисел). Смещение центра камеры → центра датчика в метрах в СК камеры: `--lever_cam dx dy dz`. Если экспорт оптики задаёт поворот «тело→мир», добавьте `--optic_rotation_body_to_world_quat`.
+
+Сохранить числа в JSON: `--export_json metrics_optic.json`.
+
+**Обрезанное тестовое видео и оптика:** если вы сохранили ролик как `test_v2_cuted.mp4` (тот же момент начала, что и в полном `test_v2.mp4`), обрежьте CSV оптики под длительность нового файла:
+
+```bash
+python scripts/trim_optic_csv.py -i AL_Optic.csv -o AL_Optic_cuted.csv --match_video test_v2_cuted.mp4
+```
+
+Если вырезка на шкале оптики **не с нуля** (кусок из середины записи), задайте `--optic_time_start <сек>` — левую границу интервала на оси `Timestamp` в `AL_Optic.csv`. Явные границы: `--t_min` / `--t_max`.
+
+**Пики / резкие повороты в оптике:** в `AL_Optic.csv` есть `ang_vel_*`. Отчёт и пороги:
+
+```bash
+python scripts/optic_angular_peaks.py -i AL_Optic.csv --report --top_peaks 20
+```
+
+Убрать отсчёты с большой угловой скоростью из CSV (для сравнения с ML; линейная интерполяция между оставшимися точками сгладит разрывы):
+
+```bash
+python scripts/optic_angular_peaks.py -i AL_Optic_cuted.csv -o AL_Optic_cuted_smooth.csv --threshold 0.85
+```
+
+Или порог по квантилю: `--threshold_quantile 0.995`. Интервалы времени «выше порога» (для ручной нарезки **видео** в тех же местах): `--bad_intervals_json bad_motion.json`. Вырезать те же куски из ролика удобнее в редакторе по таймкодам из отчёта или отдельным `ffmpeg` по интервалам из JSON.
+
+Пересборка тестовой сцены после смены видео: `./scripts/make_dataset.sh test_v2_cuted.mp4 test_v2_scene` (или новая папка), затем снова `infer.py` и `compare_ml_optic.py` с тем же `--frames_fps` и путём к обрезанному `AL_Optic_*.csv`.
+
+Переменные окружения пайплайна: `TEST_VIDEO=test_v2_cuted.mp4`, `OPTIC_CSV=AL_Optic_cuted.csv` (см. `scripts/run_pipeline_v2.sh`).
+
+Краткое резюме для научного руководителя (метрики, интерпретация, что воспроизвести): **`FOR_ADVISOR.md`**.
+
+---
+
 ## Контекст и выводы
 
 ### COLMAP: как это работает
@@ -221,6 +305,7 @@ xyz, quat = predict_pose(model, transform, device, "frame.jpg")  # или PIL.Im
 
 ```
 ├── configs/                    # YAML-конфиги обучения
+│   ├── train_v2.yaml           # PoseNet+ на train_v2_scene
 │   ├── new_video_train.yaml    # PoseNet+ на своей сцене
 │   ├── new_video_train_atloc.yaml
 │   ├── new_video_train_transposenet.yaml
@@ -228,6 +313,10 @@ xyz, quat = predict_pose(model, transform, device, "frame.jpg")  # или PIL.Im
 ├── scripts/
 │   ├── make_dataset.sh         # Видео → кадры → COLMAP → poses.csv
 │   ├── extract_colmap_poses.py # Парсинг COLMAP → poses.csv
+│   ├── compare_ml_optic.py     # ML vs AL_Optic.csv (Umeyama + метрики)
+│   ├── trim_optic_csv.py       # Обрезка оптики под длительность видео / t_min–t_max
+│   ├── optic_angular_peaks.py # Пики |ω|, фильтр CSV, JSON интервалов для нарезки
+│   ├── run_pipeline_v2.sh    # train_v2/test_v2 + оптика
 │   └── run_benchmark_all.sh    # Обучение всех моделей + бенчмарк
 ├── src/
 │   ├── models/                 # PoseNet+, AtLoc, TransPoseNet, MS-Transformer
@@ -240,6 +329,7 @@ xyz, quat = predict_pose(model, transform, device, "frame.jpg")  # или PIL.Im
 ├── benchmark.py                # Сравнение моделей + замер скорости
 ├── run_inference_single.py      # Инференс одного кадра (рантайм)
 ├── requirements.txt
+├── FOR_ADVISOR.md            # Резюме для научника (метрики, пайплайн)
 └── README.md
 ```
 
