@@ -247,8 +247,6 @@ python scripts/optic_angular_peaks.py -i AL_Optic_cuted.csv -o AL_Optic_cuted_sm
 
 Переменные окружения пайплайна: `TEST_VIDEO=test_v2_cuted.mp4`, `OPTIC_CSV=AL_Optic_cuted.csv` (см. `scripts/run_pipeline_v2.sh`).
 
-Краткое резюме для научного руководителя (метрики, интерпретация, что воспроизвести): **`FOR_ADVISOR.md`**.
-
 ---
 
 ## Контекст и выводы
@@ -329,7 +327,6 @@ python scripts/optic_angular_peaks.py -i AL_Optic_cuted.csv -o AL_Optic_cuted_sm
 ├── benchmark.py                # Сравнение моделей + замер скорости
 ├── run_inference_single.py      # Инференс одного кадра (рантайм)
 ├── requirements.txt
-├── FOR_ADVISOR.md            # Резюме для научника (метрики, пайплайн)
 └── README.md
 ```
 
