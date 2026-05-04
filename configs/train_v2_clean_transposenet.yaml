@@ -1,0 +1,38 @@
+# TransPoseNet на train_v2_scene_clean (для сравнения с PoseNet)
+# Train: python train.py --config configs/train_v2_transposenet.yaml
+
+data:
+  type: "colmap"
+  root: "train_v2_scene_clean"
+  image_size: 224
+  train_split: 0.8
+  normalize: false
+  num_workers: 0
+
+model:
+  name: "transposenet"
+  params:
+    backbone: "resnet34"
+    pretrained: true
+    unfreeze_last_n: 2
+    dropout: 0.1
+    hidden_dim: 512
+    num_heads: 8
+    num_layers: 4
+    transformer_dim: 256
+
+training:
+  epochs: 80
+  batch_size: 16
+  lr: 5.0e-5
+  weight_decay: 1.0e-4
+  scheduler: "cosine"
+  warmup_epochs: 3
+  patience: 15
+  amp: false
+  force_cpu: true
+
+output:
+  dir: "outputs_clean"
+  save_best: true
+  tensorboard: true

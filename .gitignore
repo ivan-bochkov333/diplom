@@ -14,6 +14,10 @@ new_video_train/
 new_video_test/
 train_v2_scene/
 test_v2_scene/
+train_v2_scene_clean/
+test_v2_scene_clean/
+train_v2_scene_15fps/
+test_v2_scene_15fps/
 *.mp4
 
 # Телеметрия оптики (положите локально; при необходимости снимите с игнора)
@@ -21,6 +25,7 @@ AL_Optic*.csv
 
 # Training outputs
 outputs/
+outputs_clean/
 *.pth
 
 # IDE

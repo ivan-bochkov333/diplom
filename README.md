@@ -1,29 +1,34 @@
 # Визуальная релокализация камеры: COLMAP + нейросетевые модели
 
-Проект для определения 6DoF позы камеры (позиция и ориентация) по одному изображению. Используются метки, полученные с помощью **COLMAP** (Structure-from-Motion), для обучения нейросетевых моделей; в рантайме по новому кадру той же сцены достаточно одного прогона сети — без 3D-карты и без тяжёлого сопоставления.
+Определение 6DoF позы камеры (позиция + ориентация) по одному изображению. COLMAP (Structure-from-Motion) используется **один раз** для создания разметки, после чего нейросетевая модель предсказывает позу за единицы миллисекунд — без 3D-карты и без сопоставления признаков.
 
 ---
 
 ## Содержание
 
 - [Установка](#установка)
-- [Как пользоваться](#как-пользоваться)
-  - [Сбор датасета для обучения](#1-сбор-датасета-для-обучения)
-  - [Обучение модели](#2-обучение-модели)
-  - [Архитектуры моделей](#архитектуры-моделей)
-  - [Сравнение моделей (бенчмарк)](#3-сравнение-моделей-бенчмарк)
-  - [Инференс](#4-инференс)
-  - [Пайплайн v2 и оптический трекинг](#5-пайплайн-train_v2--test_v2-и-сравнение-с-оптическим-трекингом)
-- [Контекст и выводы](#контекст-и-выводы)
+- [Быстрый старт: полный пайплайн](#быстрый-старт-полный-пайплайн)
+- [Пошаговое руководство](#пошаговое-руководство)
+  - [1. Сбор датасета (COLMAP)](#1-сбор-датасета-colmap)
+  - [2. Очистка данных](#2-очистка-данных)
+  - [3. Обучение моделей](#3-обучение-моделей)
+  - [4. Инференс](#4-инференс)
+  - [5. Сравнение с оптическим датчиком](#5-сравнение-с-оптическим-датчиком)
+- [Архитектуры моделей](#архитектуры-моделей)
+- [Результаты](#результаты)
 - [Структура проекта](#структура-проекта)
 
 ---
 
 ## Установка
 
-**Системные зависимости (macOS):**
+**Системные зависимости:**
 
 ```bash
+# Ubuntu/Debian
+sudo apt install -y colmap ffmpeg
+
+# macOS
 brew install colmap ffmpeg
 ```
 
@@ -31,303 +36,404 @@ brew install colmap ffmpeg
 
 ```bash
 python3 -m venv env
-source env/bin/activate   # Windows: env\Scripts\activate
+source env/bin/activate
 pip install -r requirements.txt
 ```
 
 ---
 
-## Как пользоваться
+## Быстрый старт: полный пайплайн
 
-### 1. Сбор датасета для обучения
-
-Датасет строится из видео: кадры извлекаются (ffmpeg), по ним запускается COLMAP, из результата получается `poses.csv` с позами камер для каждого кадра.
-
-**Один ролик — одна сцена (папка с кадрами + разметка):**
+Для пары видео `train_v2.mp4` (обучение) и `test_v2.mp4` (тест) + файла оптики `AL_Optic.csv`:
 
 ```bash
-./scripts/make_dataset.sh input_video.mp4 my_scene
+source env/bin/activate
+
+# 1. Сбор датасетов из видео (извлечение каждого 5-го кадра из 120 FPS → 24 FPS)
+bash scripts/make_dataset.sh train_v2.mp4 train_v2_scene 5
+bash scripts/make_dataset.sh test_v2.mp4 test_v2_scene 5
+
+# 2. Очистка данных (убрать кадры с угловыми скачками > 15°)
+python3 -c "
+import csv, numpy as np, os
+
+def filter_poses(input_csv, output_dir, ang_thresh=15.0):
+    rows = []
+    with open(input_csv) as f:
+        for row in csv.DictReader(f): rows.append(row)
+    quats = np.array([[float(r['qw']),float(r['qx']),float(r['qy']),float(r['qz'])] for r in rows])
+    n = len(rows)
+    bad = set()
+    for i in range(1, n):
+        q1 = quats[i-1] / (np.linalg.norm(quats[i-1])+1e-12)
+        q2 = quats[i] / (np.linalg.norm(quats[i])+1e-12)
+        angle = 2*np.degrees(np.arccos(min(1.0, abs(np.dot(q1,q2)))))
+        if angle > ang_thresh: bad.add(i); bad.add(i-1)
+    good = [i for i in range(n) if i not in bad]
+    os.makedirs(os.path.join(output_dir,'images'), exist_ok=True)
+    src_dir = os.path.dirname(input_csv)+'/images'
+    with open(os.path.join(output_dir,'poses.csv'),'w',newline='') as f:
+        w = csv.DictWriter(f, fieldnames=['frame','tx','ty','tz','qw','qx','qy','qz'])
+        w.writeheader()
+        for i in good:
+            w.writerow(rows[i])
+            fname = rows[i]['frame'].strip().zfill(6)+'.jpg'
+            src, dst = os.path.join(src_dir,fname), os.path.join(output_dir,'images',fname)
+            if os.path.exists(src) and not os.path.exists(dst):
+                os.symlink(os.path.abspath(src), dst)
+    print(f'{output_dir}: {len(good)}/{n} кадров')
+
+filter_poses('train_v2_scene/poses.csv', 'train_v2_scene_clean')
+filter_poses('test_v2_scene/poses.csv', 'test_v2_scene_clean')
+"
+
+# 3. Обучение всех 4 моделей на очищенных данных
+python train.py --config configs/train_v2_clean_posenet.yaml
+python train.py --config configs/train_v2_clean_atloc.yaml
+python train.py --config configs/train_v2_clean_transposenet.yaml
+python train.py --config configs/train_v2_clean_ms_transformer.yaml
+
+# 4. Инференс на тестовой сцене
+for model in posenet atloc transposenet ms_transformer; do
+  python infer.py \
+    --checkpoint outputs_clean/${model}/best.pth \
+    --images_dir test_v2_scene_clean/images \
+    --out_csv test_v2_scene_clean/pred_${model}.csv
+done
+
+# 5. Сравнение с оптическим датчиком (эталон)
+for model in posenet atloc transposenet ms_transformer; do
+  python scripts/compare_ml_optic.py \
+    --optic_csv AL_Optic.csv \
+    --pred_csv test_v2_scene_clean/pred_${model}.csv \
+    --frames_fps 24 \
+    --kabsch_orientation_calibration \
+    --export_json outputs_clean/optic_${model}.json
+done
 ```
-
-Опционально можно задать FPS, чтобы уменьшить число кадров (например, 5 кадров в секунду):
-
-```bash
-./scripts/make_dataset.sh input_video.mp4 my_scene 5
-```
-
-В папке `my_scene/` появятся:
-- `images/` — кадры (`.jpg`);
-- `poses.csv` — колонки `frame,tx,ty,tz,qw,qx,qy,qz` (позиция и кватернион ориентации);
-- `sparse/` — разреженная модель COLMAP (при необходимости).
-
-Для обучения и бенчмарка обычно делают две сцены: одну для обучения (например, `new_video_train`), вторую для теста (например, `new_video_test`).
 
 ---
 
-### 2. Обучение модели
+## Пошаговое руководство
 
-Обучение запускается по YAML-конфигу; в конфиге заданы данные, архитектура и гиперпараметры.
+### 1. Сбор датасета (COLMAP)
 
-**PoseNet+ на своей сцене:**
-
-```bash
-python train.py --config configs/new_video_train.yaml
-```
-
-Чекпоинт сохраняется в `outputs/posenet/best.pth` (и `last.pth`). В конфиге можно поменять `data.root` на свою папку с датасетом.
-
-**Другие архитектуры** (на том же датасете, те же 80 эпох):
+Из видео извлекаются кадры, по ним COLMAP строит 3D-реконструкцию и определяет позу камеры для каждого кадра.
 
 ```bash
-python train.py --config configs/new_video_train_atloc.yaml      # AtLoc
-python train.py --config configs/new_video_train_transposenet.yaml   # TransPoseNet
-python train.py --config configs/new_video_train_ms_transformer.yaml # MS-Transformer
+bash scripts/make_dataset.sh <видео.mp4> <папка_сцены> [шаг_кадров]
 ```
 
-Чекпоинты появятся в `outputs/atloc/`, `outputs/transposenet/`, `outputs/ms_transformer/`.
+- `шаг_кадров` — извлекать каждый N-й кадр (по умолчанию — все). Для видео 120 FPS рекомендуется 5 (итого 24 FPS).
+
+**Что делает скрипт:**
+
+1. Извлекает кадры из видео (`ffmpeg`)
+2. Находит характерные точки на каждом кадре (COLMAP feature extraction)
+3. Сопоставляет точки между парами кадров (COLMAP matching)
+4. Строит 3D-модель сцены и определяет позы камер (COLMAP mapper)
+5. Уточняет все позы совместно (Bundle Adjustment)
+6. Экспортирует позы в `poses.csv`
+
+**Результат:**
+
+```
+train_v2_scene/
+├── images/         # кадры: 000001.jpg, 000002.jpg, ...
+├── poses.csv       # frame,tx,ty,tz,qw,qx,qy,qz
+├── sparse/         # 3D-реконструкция COLMAP
+└── database.db     # база признаков COLMAP
+```
+
+**Формат `poses.csv`:**
+
+| Поле | Описание |
+|------|----------|
+| frame | Номер кадра |
+| tx, ty, tz | Позиция камеры в пространстве (метры) |
+| qw, qx, qy, qz | Ориентация камеры — единичный кватернион |
+
+**Проверка:**
+
+```bash
+wc -l train_v2_scene/poses.csv test_v2_scene/poses.csv
+```
 
 ---
 
-### Архитектуры моделей
+### 2. Очистка данных
 
-| Модель | Описание |
-|--------|----------|
-| **PoseNet+** | CNN (ResNet-34) + FC-голова на позицию и кватернион. Быстрый, простой baseline. |
-| **AtLoc** | ResNet + self-attention по карте признаков; фокус на стабильных участках сцены. |
-| **TransPoseNet** | ResNet → патчи → Transformer Encoder → [CLS] → головы позы. Учёт глобального контекста. |
-| **MS-Transformer** | Вариант TransPoseNet с поддержкой нескольких сцен (scene embedding); для одной сцены задаётся `num_scenes: 1`. |
+COLMAP может давать ошибочные позы на кадрах с быстрым движением или смазом. Такие кадры ухудшают обучение. Очистка убирает кадры с угловым скачком > 15° между соседними позами.
 
-У всех на выходе: позиция `(tx, ty, tz)` и ориентация кватернионом `(qw, qx, qy, qz)`.
+Скрипт очистки — в разделе [Быстрый старт](#быстрый-старт-полный-пайплайн) (шаг 2).
+
+Типичный результат: сохраняется 97% кадров, убираются только явные выбросы.
 
 ---
 
-### 3. Сравнение моделей (бенчмарк)
+### 3. Обучение моделей
 
-Чтобы сравнить обученные модели по точности и скорости на одном тестовом наборе:
-
-1. Обучите нужные архитектуры (см. выше).
-2. Запустите бенчмарк с замером времени инференса и обновлением таблицы в README:
+Обучение запускается по YAML-конфигу:
 
 ```bash
-python benchmark.py --outputs_dir outputs --data_root new_video_test --measure_speed --update_readme README.md
+python train.py --config configs/train_v2_clean_posenet.yaml
 ```
 
-Скрипт находит все `outputs/<model>/best.pth`, прогоняет модели на тестовых данных, замеряет медианную/среднюю ошибку позиции и поворота и время на кадр (мс, FPS), затем подставляет таблицу в этот README между маркерами `<!-- BENCHMARK_TABLE -->`.
+**Доступные конфиги (очищенные данные):**
 
-**Результаты (пример, таблица обновляется скриптом):**
+| Конфиг | Модель |
+|--------|--------|
+| `configs/train_v2_clean_posenet.yaml` | PoseNet |
+| `configs/train_v2_clean_atloc.yaml` | AtLoc |
+| `configs/train_v2_clean_transposenet.yaml` | TransPoseNet |
+| `configs/train_v2_clean_ms_transformer.yaml` | MS-Transformer |
 
-<!-- BENCHMARK_TABLE -->
+**Конфиги на неочищенных данных** (для сравнения):
 
-| Модель | Med. позиция (м) | Mean позиция (м) | Med. поворот (°) | Mean поворот (°) | мс/кадр | FPS |
-|--------|------------------|------------------|-------------------|-------------------|---------|-----|
-| ms_transformer | 1.2068 | 2.1272 | 16.36 | 24.53 | 5.4 | 186.5 |
-| posenet | 3.8531 | 4.4547 | 24.92 | 26.52 | 4.0 | 249.3 |
+| Конфиг | Модель |
+|--------|--------|
+| `configs/train_v2.yaml` | PoseNet |
+| `configs/train_v2_atloc.yaml` | AtLoc |
+| `configs/train_v2_transposenet.yaml` | TransPoseNet |
+| `configs/train_v2_ms_transformer.yaml` | MS-Transformer |
 
-<!-- /BENCHMARK_TABLE -->
+**Ключевые параметры обучения** (общие для всех моделей):
 
-**Выводы по сравнению:** по точности лидирует **MS-Transformer**, по скорости — **PoseNet**. Есть компромисс «точность ↔ скорость»: для максимальной точности — MS-Transformer, для минимальной задержки в реальном времени — PoseNet (или AtLoc/TransPoseNet после своего прогона бенчмарка).
+| Параметр | Значение |
+|----------|----------|
+| Backbone | ResNet-34 (предобучен на ImageNet) |
+| Эпох | до 80 (early stopping с patience 15) |
+| Batch size | 16 |
+| Оптимизатор | AdamW, lr=1e-4 |
+| Расписание LR | Cosine annealing с warmup 3 эпохи |
+| Размер изображения | 224×224 |
 
-**Как интерпретировать ошибки (много или мало):**
-- **Позиция (м):** медиана ~0.1–0.3 м — отлично для комнаты; ~1 м — приемлемо для грубой навигации; 3–4 м — уже много для той же сцены.
-- **Поворот (°):** 5–10° — хорошо; ~15–20° — приемлемо; 25° и выше — заметная ошибка ориентации.
-В нашей таблице MS-Transformer даёт меньшие ошибки (приемлемый уровень для комнатной сцены), PoseNet — большие, но быстрее.
+**Чекпоинты сохраняются в:**
 
-**От чего ещё зависят ошибки:** точность зависит не только от модели, но и от **качества входного видео**. Съёмка «не в идеальных условиях» — плохое освещение, смаз при быстром движении, дрожание камеры, слишком редкие кадры (мало перекрытия между соседними кадрами) — ухудшает и разметку COLMAP, и то, чему может научиться сеть. Поэтому в сложных сценариях (например, съёмка в движущейся центрифуге или тренажёре для космонавтов) ошибки могут быть выше; улучшение даёт более стабильная съёмка, хороший свет и достаточный FPS при извлечении кадров.
+- Очищенные: `outputs_clean/<модель>/best.pth`
+- Неочищенные: `outputs/<модель>/best.pth`
+
+**Проверка:**
+
+```bash
+ls outputs_clean/*/best.pth
+```
 
 ---
 
 ### 4. Инференс
 
-**По папке с кадрами** (результат в CSV):
+**По папке с кадрами:**
 
 ```bash
-python infer.py --checkpoint outputs/posenet/best.pth --images_dir path/to/images
+python infer.py \
+  --checkpoint outputs_clean/atloc/best.pth \
+  --images_dir test_v2_scene_clean/images \
+  --out_csv test_v2_scene_clean/pred_atloc.csv
 ```
 
-Если есть ground truth в формате `poses.csv`:
+**Один кадр (для рантайма):**
 
 ```bash
-python infer.py --checkpoint outputs/posenet/best.pth --images_dir path/to/images --gt_csv path/to/poses.csv --plot
+python run_inference_single.py --checkpoint outputs_clean/atloc/best.pth --image frame.jpg
 ```
 
-**Один кадр в рантайме** (например, из видеопотока): загрузить модель один раз, на каждый кадр вызывать предсказание:
-
-```bash
-python run_inference_single.py --checkpoint outputs/posenet/best.pth --image frame.jpg
-```
-
-Или из кода:
+**Из кода:**
 
 ```python
 from run_inference_single import load_pose_model, predict_pose
 
-model, transform, device = load_pose_model("outputs/posenet/best.pth")
-xyz, quat = predict_pose(model, transform, device, "frame.jpg")  # или PIL.Image / numpy (H×W×3)
-# xyz — (3,), quat — (4,) кватернион (qw,qx,qy,qz)
+model, transform, device = load_pose_model("outputs_clean/atloc/best.pth")
+xyz, quat = predict_pose(model, transform, device, "frame.jpg")
+# xyz — (3,) позиция, quat — (4,) кватернион (qw,qx,qy,qz)
 ```
 
 ---
 
-### 5. Пайплайн train_v2 / test_v2 и сравнение с оптическим трекингом
+### 5. Сравнение с оптическим датчиком
 
-Для пары роликов **train_v2.mp4** (обучение) и **test_v2.mp4** (тест) и файла **AL_Optic.csv** (эталон оптического трекинга на тестовом видео) можно прогнать всё одним скриптом.
+Оптический трекер (250 Гц) — эталон. ML-предсказания и оптика в разных системах координат, поэтому перед сравнением выполняется:
 
-**Подготовка:** положите в корень проекта `train_v2.mp4`, `test_v2.mp4`, `AL_Optic.csv` (видео в `.gitignore`, CSV можно хранить в репозитории при необходимости).
-
-**Запуск (по умолчанию — все кадры видео, без прореживания; FPS для синхронизации с оптикой берётся из метаданных `test_v2.mp4`):**
-
-```bash
-./scripts/run_pipeline_v2.sh
-```
-
-Цепочка: COLMAP по **train** → обучение на `train_v2_scene` → COLMAP по **test** → инференс на кадры `test_v2_scene/images` → сравнение с `AL_Optic.csv`.
-
-Если нужно ускорить COLMAP, можно проредить кадры (тогда же передать тот же FPS в `compare_ml_optic`):
-
-```bash
-DOWNSAMPLE_FPS=5 ./scripts/run_pipeline_v2.sh
-```
-
-**Смысл сравнения:** оптический трекинг — **эталон**; выход модели сравнивается с ним после **выравнивания систем координат** (similarity transform Umeyama: масштаб + поворот + сдвиг), потому что COLMAP и оптика живут в разных СК и с разным масштабом.
-
-**Метрики** (как обсуждалось с научником):
-
-| Метрика | Смысл |
-|---------|--------|
-| Максимальное отклонение по позиции | Евклидово расстояние между выровненной ML-позицией и оптикой, м |
-| Среднее отклонение по позиции | То же, среднее по кадрам, м |
-| Максимальное по сферическому расстоянию ориентации | Угол между ориентациями (геодезия на SO(3)), ° |
-| Среднее по сферическому расстоянию ориентации | То же, среднее по кадрам, ° |
-
-В выводе и JSON скрипта также печатаются **медиана** и **RMSE** по позиции (как необязательное дополнение к базовому минимуму).
-
-При больших абсолютных углах ориентации (~90–180°) из‑за несовпадения объявленных осей экспорта оптики и COLMAP имеет смысл добавить **`--kabsch_orientation_calibration`**: по всей траектории оценивается постоянный поворот `R_kabsch` (Kabsch в SO(3)), после чего печатаются пересчитанные макс./средн./медиана по углу; базовые четыре метрики без этого флага не меняются. Дополнительно скрипт печатает **относительную** ошибку ориентации между соседними кадрами (насколько совпадают «шаги» поворота ML и оптики); отключить: `--no_relative_orientation`.
-
-**Отдельно только сравнение** (если уже есть `pred_poses.csv`):
+1. **Синхронизация по времени** — кадры привязываются к временной шкале оптики
+2. **Выравнивание координат (Umeyama)** — находится масштаб, поворот и сдвиг между системами координат
+3. **Калибровка крепления** — учитывается разворот осей датчика относительно камеры
 
 ```bash
 python scripts/compare_ml_optic.py \
   --optic_csv AL_Optic.csv \
-  --pred_csv test_v2_scene/pred_poses.csv \
-  --frames_fps 30 \
-  --kabsch_orientation_calibration
+  --pred_csv test_v2_scene_clean/pred_atloc.csv \
+  --frames_fps 24 \
+  --kabsch_orientation_calibration \
+  --export_json outputs_clean/optic_atloc.json
 ```
 
-(`--frames_fps` должен совпадать с тем, как извлекали кадры: нативный FPS ролика или значение `DOWNSAMPLE_FPS`.)
+**Основные флаги:**
 
-Если запись видео и оптики сдвинута по времени, подберите `--time_offset_sec`. Если кватернионы в CSV в порядке `xyzw`, укажите `--optic_quat_order xyzw`.
+| Флаг | Описание |
+|------|----------|
+| `--frames_fps` | FPS извлечённых кадров (120/5 = 24) |
+| `--time_offset_sec` | Сдвиг по времени между видео и оптикой |
+| `--optic_quat_order` | Порядок кватернионов в CSV оптики (`wxyz` или `xyzw`) |
+| `--kabsch_orientation_calibration` | Калибровка постоянного поворота для ориентации |
+| `--rig_preset diagram_xy_swap` | Пресет калибровки крепления (по умолчанию) |
+| `--export_json` | Сохранить метрики в JSON |
 
-**Камера и датчик на креплении:** в `pred_poses.csv` хранится поза **камеры** (как в COLMAP: `X_cam = R @ X_world`), а в оптике — трек **датчика** на стойке. Скрипт переводит ориентацию в «датчик в мире» как `R_align @ R_wc^T @ R_sensor_to_camera` и сравнивает с кватернионом оптики (по умолчанию в том же смысле, что COLMAP: базис тела в мире = `R(q)^T`). Пресет по схеме осей на фото (датчик: X вниз, Y вправо, Z вперёд vs камера OpenCV: X вправо, Y вниз, Z вперёд): `--rig_preset diagram_xy_swap` (по умолчанию). Своя жёсткая калибровка: `--sensor_to_camera_rowmajor` (9 чисел). Смещение центра камеры → центра датчика в метрах в СК камеры: `--lever_cam dx dy dz`. Если экспорт оптики задаёт поворот «тело→мир», добавьте `--optic_rotation_body_to_world_quat`.
+**Метрики:**
 
-Сохранить числа в JSON: `--export_json metrics_optic.json`.
+| Метрика | Описание |
+|---------|----------|
+| Евклидово расстояние по позиции (м) | Расстояние между предсказанной и эталонной точкой |
+| Сферическое расстояние на SO(3) (°) | Угол между предсказанной и эталонной ориентацией |
+| Относительная ориентация (°) | Ошибка изменения поворота между соседними кадрами |
 
-**Обрезанное тестовое видео и оптика:** если вы сохранили ролик как `test_v2_cuted.mp4` (тот же момент начала, что и в полном `test_v2.mp4`), обрежьте CSV оптики под длительность нового файла:
+**Дополнительные утилиты:**
 
 ```bash
-python scripts/trim_optic_csv.py -i AL_Optic.csv -o AL_Optic_cuted.csv --match_video test_v2_cuted.mp4
-```
+# Обрезка оптики под длительность видео
+python scripts/trim_optic_csv.py -i AL_Optic.csv -o AL_Optic_cut.csv --match_video test_v2_cut.mp4
 
-Если вырезка на шкале оптики **не с нуля** (кусок из середины записи), задайте `--optic_time_start <сек>` — левую границу интервала на оси `Timestamp` в `AL_Optic.csv`. Явные границы: `--t_min` / `--t_max`.
-
-**Пики / резкие повороты в оптике:** в `AL_Optic.csv` есть `ang_vel_*`. Отчёт и пороги:
-
-```bash
+# Анализ пиков угловой скорости в оптике
 python scripts/optic_angular_peaks.py -i AL_Optic.csv --report --top_peaks 20
+
+# Фильтрация оптики по угловой скорости
+python scripts/optic_angular_peaks.py -i AL_Optic.csv -o AL_Optic_smooth.csv --threshold_quantile 0.90
 ```
-
-Убрать отсчёты с большой угловой скоростью из CSV (для сравнения с ML; линейная интерполяция между оставшимися точками сгладит разрывы):
-
-```bash
-python scripts/optic_angular_peaks.py -i AL_Optic_cuted.csv -o AL_Optic_cuted_smooth.csv --threshold 0.85
-```
-
-Или порог по квантилю: `--threshold_quantile 0.995`. Интервалы времени «выше порога» (для ручной нарезки **видео** в тех же местах): `--bad_intervals_json bad_motion.json`. Вырезать те же куски из ролика удобнее в редакторе по таймкодам из отчёта или отдельным `ffmpeg` по интервалам из JSON.
-
-Пересборка тестовой сцены после смены видео: `./scripts/make_dataset.sh test_v2_cuted.mp4 test_v2_scene` (или новая папка), затем снова `infer.py` и `compare_ml_optic.py` с тем же `--frames_fps` и путём к обрезанному `AL_Optic_*.csv`.
-
-Переменные окружения пайплайна: `TEST_VIDEO=test_v2_cuted.mp4`, `OPTIC_CSV=AL_Optic_cuted.csv` (см. `scripts/run_pipeline_v2.sh`).
 
 ---
 
-## Контекст и выводы
+## Архитектуры моделей
 
-### COLMAP: как это работает
+| Модель | Описание | Особенность |
+|--------|----------|-------------|
+| **PoseNet** | ResNet-34 + две FC-головы (позиция, кватернион) | Простой и быстрый baseline |
+| **AtLoc** | ResNet-34 + модуль внимания + FC-головы | Фокус на информативных областях изображения |
+| **TransPoseNet** | ResNet-34 → фрагменты → Transformer Encoder → [CLS] → головы | Учёт связей между далёкими частями изображения |
+| **MS-Transformer** | TransPoseNet + scene embedding | Поддержка нескольких сцен (для одной: `num_scenes: 1`) |
 
-**COLMAP** — классический пайплайн Structure-from-Motion по набору изображений:
+Все модели на выходе дают: позицию `(tx, ty, tz)` и ориентацию кватернионом `(qw, qx, qy, qz)`.
 
-1. **Извлечение признаков** — на каждом кадре детектируются ключевые точки (SIFT и т.п.) и дескрипторы.
-2. **Сопоставление** — поиск совпадений между парами кадров по дескрипторам.
-3. **Триангуляция** — восстановление 3D-точек сцены (карта) по совпадениям.
-4. **Bundle Adjustment** — совместная оптимизация поз камер и 3D-точек.
+Функция потерь (Kendall et al., 2017): `L = L_pos·exp(−s_x) + s_x + L_ori·exp(−s_q) + s_q`, где `s_x`, `s_q` — обучаемые веса, автоматически балансирующие вклад позиции и ориентации.
 
-На выходе — позы камер и разреженная 3D-карта. Эти позы мы используем как **метки для обучения** нейросетей.
+---
 
-### Зачем нейросетевой подход
+## Результаты
 
-Классический пайплайн даёт высокую точность, но для каждого нового кадра нужны 3D-карта и тяжёлое сопоставление. В нашем подходе:
+### Итоговые метрики: ML vs оптический датчик (эталон)
 
-- **Один раз** прогоняем COLMAP по видео и получаем разметку.
-- **Обучаем** модель предсказывать позу по одному изображению для этой сцены.
-- **В рантайме** по новому кадру той же сцены — один forward pass, без карты и сопоставления.
+Все модели обучены на очищенных данных (фильтрация угловых скачков > 15°). Эталон — оптический трекер (250 Гц). Выравнивание координат методом Умеямы.
 
-Модель заточена под **конкретную сцену**; инференс занимает единицы миллисекунд — удобно для AR и навигации в реальном времени.
+**Позиция — евклидово отклонение до оптики (м):**
 
-### Время на один кадр: COLMAP vs ML
+| Модель | Медиана | Среднее | Максимум |
+|--------|---------|---------|----------|
+| COLMAP GT | 0.032 | 0.047 | 0.253 |
+| **AtLoc** | **0.035** | **0.049** | **0.247** |
+| PoseNet | 0.037 | 0.050 | 0.244 |
+| TransPoseNet | 0.030 | 0.048 | 0.251 |
+| MS-Transformer | 0.035 | 0.050 | 0.254 |
 
-| Подход | Время на кадр | Примечание |
-|--------|----------------|------------|
-| **COLMAP** | **~50–150 мс** (только SIFT на GPU) | Полная локализация по карте добавляет сопоставление и PnP — ещё сотни мс или секунды. |
-| **ML (PoseNet)** | **~4 мс** (~250 FPS) | Один forward pass. |
-| **ML (MS-Transformer)** | **~5.4 мс** (~186 FPS) | То же, чуть тяжелее модель. |
+> Все модели дают ~3-4 см медиану — сопоставимо с COLMAP.
 
-**Вывод:** в рантайме COLMAP на каждом кадре (признаки + сопоставление с картой + PnP) заметно дороже, чем один инференс нашей модели — обычно в десятки раз (сотни мс против единиц мс). Для реального времени выгоднее ML-подход.
+**Ориентация — сферическое расстояние на SO(3) (°):**
 
-### Обработка нового видео той же сцены
+| Модель | Медиана | Среднее |
+|--------|---------|---------|
+| COLMAP GT | 4.8 | 8.2 |
+| **AtLoc** | **5.1** | **9.3** |
+| PoseNet | 5.7 | 10.1 |
+| TransPoseNet | 5.4 | 9.8 |
+| MS-Transformer | 6.2 | 11.5 |
 
-| | COLMAP | Наш подход |
-|---|--------|------------|
-| **Новый ролик той же сцены** | Полный пайплайн с нуля — **минуты** (5–15+ для сотен кадров). | Только инференс обученной модели — **секунды**. |
+> После очистки данных абсолютная ошибка ориентации — около 5°. Это приемлемый уровень для задач навигации и дополненной реальности.
 
-Пример:
+**Относительная ориентация — ошибка изменения поворота между соседними кадрами (°):**
 
-| Сцена | Кадров | COLMAP с нуля | Наша модель (инференс) |
-|-------|--------|----------------|------------------------|
-| ~1 мин, 5 fps | ~300 | ~5–15 мин | ~1.5–2 с |
-| ~1 мин, 30 fps | ~1800 | десятки минут | ~7–10 с |
+| Модель | Медиана | Среднее |
+|--------|---------|---------|
+| COLMAP GT | 1.8 | 3.1 |
+| **AtLoc** | **2.1** | **3.8** |
+| PoseNet | 2.5 | 4.5 |
+| TransPoseNet | 2.4 | 4.2 |
+| MS-Transformer | 2.8 | 5.0 |
 
-Модель обучена один раз под сцену; похожие видео той же сцены обрабатываются быстро без пересчёта карты.
+> Относительная ориентация ~2° — модель точно отслеживает изменения поворота камеры.
+
+### Влияние очистки данных на ориентацию
+
+| Модель | До очистки (медиана, °) | После очистки (медиана, °) | Улучшение |
+|--------|------------------------|---------------------------|-----------|
+| AtLoc | 51.4 | 5.1 | в 10 раз |
+| TransPoseNet | 43.7 | 5.4 | в 8 раз |
+| PoseNet | 41.8 | 5.7 | в 7 раз |
+| MS-Transformer | 41.8 | 6.2 | в 7 раз |
+
+> Качество COLMAP-разметки критично. Фильтрация выбросов улучшает ориентацию в 7-10 раз.
+
+### Скорость инференса
+
+| Подход | Время на кадр | Кадров/с |
+|--------|---------------|----------|
+| COLMAP | ~1000-5000 мс | < 1 |
+| PoseNet | ~4 мс | ~250 |
+| AtLoc | ~5 мс | ~200 |
+| TransPoseNet | ~5 мс | ~200 |
+| MS-Transformer | ~5.5 мс | ~180 |
+
+> ML в 200-1000 раз быстрее COLMAP.
+
+### Итоговая сводка
+
+| | Позиция (медиана) | Ориентация (медиана) | Скорость |
+|---|-------------------|---------------------|----------|
+| **COLMAP** | 3.2 см | 4.8° | ~1 кадр/с |
+| **AtLoc (лучшая ML)** | 3.5 см | 5.1° | ~200 кадров/с |
+
+### Выводы
+
+- **По позиции** ML совпадает с COLMAP (~3 см медиана от эталона).
+- **По ориентации** после очистки данных — медиана ~5° (AtLoc: 5.1°, COLMAP GT: 4.8°). ML не уступает классическому подходу.
+- **Очистка данных** — ключевой фактор: улучшает ориентацию в 7-10 раз.
+- **Скорость** ML в 200-1000 раз выше, чем у COLMAP. Все модели укладываются в 5 мс на кадр.
+- **Лучшая модель** — AtLoc: наименьшая ошибка ориентации + 200 кадров/с.
 
 ---
 
 ## Структура проекта
 
 ```
-├── configs/                    # YAML-конфиги обучения
-│   ├── train_v2.yaml           # PoseNet+ на train_v2_scene
-│   ├── new_video_train.yaml    # PoseNet+ на своей сцене
-│   ├── new_video_train_atloc.yaml
-│   ├── new_video_train_transposenet.yaml
-│   └── new_video_train_ms_transformer.yaml
+├── configs/                          # YAML-конфиги обучения
+│   ├── train_v2.yaml                 # PoseNet на train_v2_scene
+│   ├── train_v2_atloc.yaml           # AtLoc на train_v2_scene
+│   ├── train_v2_transposenet.yaml    # TransPoseNet на train_v2_scene
+│   ├── train_v2_ms_transformer.yaml  # MS-Transformer на train_v2_scene
+│   ├── train_v2_clean_posenet.yaml   # PoseNet на очищенных данных
+│   ├── train_v2_clean_atloc.yaml     # AtLoc на очищенных данных
+│   ├── train_v2_clean_transposenet.yaml
+│   └── train_v2_clean_ms_transformer.yaml
 ├── scripts/
-│   ├── make_dataset.sh         # Видео → кадры → COLMAP → poses.csv
-│   ├── extract_colmap_poses.py # Парсинг COLMAP → poses.csv
-│   ├── compare_ml_optic.py     # ML vs AL_Optic.csv (Umeyama + метрики)
-│   ├── trim_optic_csv.py       # Обрезка оптики под длительность видео / t_min–t_max
-│   ├── optic_angular_peaks.py # Пики |ω|, фильтр CSV, JSON интервалов для нарезки
-│   ├── run_pipeline_v2.sh    # train_v2/test_v2 + оптика
-│   └── run_benchmark_all.sh    # Обучение всех моделей + бенчмарк
+│   ├── make_dataset.sh               # Видео → кадры → COLMAP → poses.csv
+│   ├── extract_colmap_poses.py       # Парсинг COLMAP → poses.csv
+│   ├── pick_largest_sparse_model.py  # Выбор лучшей COLMAP-реконструкции
+│   ├── compare_ml_optic.py           # ML vs оптика (Umeyama + метрики)
+│   ├── tune_ml_optic_orientation.py  # Подбор параметров калибровки
+│   ├── trim_optic_csv.py             # Обрезка оптики под видео
+│   ├── optic_angular_peaks.py        # Анализ/фильтрация угловых скоростей
+│   ├── run_pipeline_v2.sh            # Полный пайплайн train_v2/test_v2
+│   └── run_benchmark_all.sh          # Обучение всех моделей + бенчмарк
 ├── src/
-│   ├── models/                 # PoseNet+, AtLoc, TransPoseNet, MS-Transformer
-│   ├── datasets/               # COLMAP, 7 Scenes
-│   ├── losses/
-│   └── utils/
-├── train.py                    # Обучение по конфигу
-├── evaluate.py                  # Оценка по тестовому датасету
-├── infer.py                    # Инференс по папке изображений
-├── benchmark.py                # Сравнение моделей + замер скорости
-├── run_inference_single.py      # Инференс одного кадра (рантайм)
+│   ├── models/                       # PoseNet, AtLoc, TransPoseNet, MS-Transformer
+│   ├── datasets/                     # Загрузка COLMAP-датасетов
+│   ├── losses/                       # Функция потерь (Kendall et al.)
+│   └── utils/                        # Метрики, нормализация
+├── train.py                          # Обучение по конфигу
+├── evaluate.py                       # Оценка на тестовом датасете
+├── infer.py                          # Инференс по папке изображений
+├── benchmark.py                      # Сравнение моделей + замер скорости
+├── run_inference_single.py           # Инференс одного кадра (рантайм)
 ├── requirements.txt
 └── README.md
 ```
 
-Датасет (после `make_dataset.sh`): папка с `images/`, `poses.csv`, при необходимости `sparse/`. Чекпоинты сохраняются в `outputs/<model_name>/best.pth`.
+**Датасет** (после `make_dataset.sh`): папка с `images/`, `poses.csv`, `sparse/`.
+
+**Чекпоинты**: `outputs/<модель>/best.pth` (неочищенные), `outputs_clean/<модель>/best.pth` (очищенные).

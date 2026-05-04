@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Headless: COLMAP использует Qt, на серверах без X11 нужен offscreen
+export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
+
 if [ $# -lt 1 ]; then
   echo "Использование: $0 video_file [project_name] [fps]"
   echo "  fps — опционально: брать N кадров в секунду (быстрее COLMAP). Без fps — все кадры."
@@ -56,7 +59,8 @@ echo "===> COLMAP feature_extractor..."
 colmap feature_extractor \
   --database_path "$DB_PATH" \
   --image_path "$IMAGES_DIR" \
-  --ImageReader.single_camera 1
+  --ImageReader.single_camera 1 \
+  --SiftExtraction.use_gpu 0
 
 # 5. COLMAP: matching
 MATCHER="${COLMAP_MATCHER:-exhaustive}"
@@ -64,11 +68,13 @@ if [ "$MATCHER" = "sequential" ]; then
   echo "===> COLMAP sequential_matcher (для видео)..."
   colmap sequential_matcher \
     --database_path "$DB_PATH" \
-    --SequentialMatching.overlap 15
+    --SequentialMatching.overlap 15 \
+    --SiftMatching.use_gpu 0
 else
   echo "===> COLMAP exhaustive_matcher..."
   colmap exhaustive_matcher \
-    --database_path "$DB_PATH"
+    --database_path "$DB_PATH" \
+    --SiftMatching.use_gpu 0
 fi
 
 # 6. COLMAP: sparse reconstruction (mapper)
